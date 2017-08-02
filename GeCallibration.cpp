@@ -96,12 +96,10 @@ public:
 		return hOut;
 	}
 
-	TF1* CalibrationFunction() {
-		TH1D* hOut = ConvertMaestroToHistogram(
-				"/Users/chrisw94/Desktop/SubtractedBackgroundFromSources.Txt",
-				"Run1Data");
-		TSpectrum* s = new TSpectrum(11);
-		Int_t nFound = s->Search(hOut, 2, "nobackground", 0.1);
+	TF1* CalibrationFunction(TString file, TString name) {
+		TH1D* hOut = ConvertMaestroToHistogram(file, name);
+		TSpectrum* s = new TSpectrum(9);
+		Int_t nFound = s->Search(hOut, 2, "nobackground", 0.05);
 		Double_t *fMeasuredADC = s->GetPositionX();
 
 		//sorting fMeasuredADC
@@ -111,45 +109,87 @@ public:
 				<< "If less than expected, adjust 'a' in Search(-,-,-,a), where a is 0<a<1"
 				<< endl;
 
-		//defining crystalball
-
 		//fit Gaussian and extract parameters
 		TCanvas *can2 = new TCanvas("can2", "Histograms for Fits", 2100, 900);
 		can2->Divide(2, 1);
 		can2->cd(1);
-
 		//create guess for standard deviations at peaks
 		Double_t sigmaGuess[nFound];
+		Double_t halfPeakPosition[nFound];
+		Double_t peakHeight[nFound];
 		for (int i = 0; i < nFound; i++) {
-			TF1 *a = new TF1("a", "gaus(0)", fMeasuredADC[i] - 15,
-					fMeasuredADC[i] + 15);
-			hOut->Fit("a", "Q", "", fMeasuredADC[i] - 15, fMeasuredADC[i] + 15);
+			int cont = fMeasuredADC[i] - 50; // Continuum location. Adjust according to peak spacing
+			peakHeight[i] = (hOut->GetBinContent(fMeasuredADC[i]))
+					- (hOut->GetBinContent(cont));
+			for (int j = 1; j < 50; j--) {
+				halfPeakPosition[i] = fMeasuredADC[i] - j;
+				if ((peakHeight[i] / 2)
+						> (hOut->GetBinContent(halfPeakPosition[i])
+								- hOut->GetBinContent(cont))) {
+					halfPeakPosition[i] += 1;
+					break;
+				}
+			}
+			sigmaGuess[i] = (fMeasuredADC[i] - halfPeakPosition[i])
+					/ (sqrt(2 * log(2)));
+			TF1 *a = new TF1("a", "gaus(0)",
+					fMeasuredADC[i] - (3 * sigmaGuess[i]),
+					fMeasuredADC[i] + (3 * sigmaGuess[i]));
+			a->SetParameter(2, sigmaGuess[i]);
+			hOut->Fit("a", "RQ");
 			a = hOut->GetFunction("a");
+			//a->DrawCopy("SAME");
+			//cout << "Chi2/NDF:" << (a->GetChisquare()) / (a->GetNDF()) << endl;
 			sigmaGuess[i] = a->GetParameter(2);
 			delete a;
 		}
-
-		//perform fits with crystal ball function
+		//Find guesses for linear fit on left of peak
+		Double_t fLeftSlope[nFound];
+		Double_t fLeftIntercept[nFound];
 		for (int i = 0; i < nFound; i++) {
-			TF1 *b =
-					new TF1("b",
-							"(((x-[2])/[3])<=(-[0]))*([4])*(([1]/abs([0]))^[1])*(exp((-[0]^2)/2))*(([1]/abs([0]))-abs([0])-((x-[2])/[3]))^(-[1]) + \(((x-[2])/[3])>(-[0]))*([4])*(exp(-(x-[2])^2/(2*[3]^2)))",
-							fMeasuredADC[i] - 20, fMeasuredADC[i] + 15);
-			b->SetParameter(0, 1.5);
-			b->SetParLimits(0,0,10);
-			b->SetParameter(1, 2);
-			b->SetParameter(2, fMeasuredADC[i]);
-			b->SetParameter(3, sigmaGuess[i]);
-			b->SetParameter(4, hOut->GetBinContent(fMeasuredADC[i]));
-			hOut->Fit("b", "R+", "", fMeasuredADC[i] - 20,
-					fMeasuredADC[i] + 15);
-			cout << "NDF: " << b->GetNDF() << endl;
+			TF1* left = new TF1("left", "pol1",
+					fMeasuredADC[i] - 6 * sigmaGuess[i],
+					fMeasuredADC[i] - 4 * sigmaGuess[i]);
+			hOut->Fit("left", "RQ");
+			fLeftIntercept[i] = left->GetParameter(0);
+			fLeftSlope[i] = left->GetParameter(1);
+			delete left;
+		}
+
+		//Find guesses for linear fit on right of peak
+		Double_t fRightSlope[nFound];
+		Double_t fRightIntercept[nFound];
+		for (int i = 0; i < nFound; i++) {
+			TF1* right = new TF1("right", "pol1",
+					fMeasuredADC[i] + 4 * sigmaGuess[i],
+					fMeasuredADC[i] + 6 * sigmaGuess[i]);
+			hOut->Fit("right", "RQ");
+			fRightIntercept[i] = right->GetParameter(0);
+			fRightSlope[i] = right->GetParameter(1);
+			delete right;
+		}
+
+		//perform fits with gauss-linear function
+
+		for (int i = 0; i < nFound; i++) {
+			TF1 *b = new TF1("b", "pol1(0) + gaus(2) + pol1(5)",
+					fMeasuredADC[i] - 6 * sigmaGuess[i],
+					fMeasuredADC[i] + 6 * sigmaGuess[i]);
+			b->SetParameter(0, fLeftIntercept[i]);
+			b->SetParameter(1, fLeftSlope[i]);
+			b->SetParameter(2, hOut->GetBinContent(fMeasuredADC[i]));
+			b->SetParameter(3, fMeasuredADC[i]);
+			b->SetParameter(4, sigmaGuess[i]);
+			b->SetParameter(5, fRightIntercept[i]);
+			b->SetParameter(6, fRightSlope[i]);
+			hOut->Fit("b", "R");
+			cout << "Chi2/NDF: " << (b->GetChisquare()) / (b->GetNDF()) << endl;
 			b = hOut->GetFunction("b");
 			b->DrawCopy("SAME");
 			//need to extract parameters
-			fMeasuredADC[i] = b->GetParameter(2);
-			fMeasuredADCError.push_back(b->GetParameter(3));
-			//delete b;
+			fMeasuredADC[i] = b->GetParameter(3);
+			fMeasuredADCError.push_back(b->GetParameter(4));
+			delete b;
 
 		}
 
@@ -182,22 +222,50 @@ public:
 			}
 		}
 		can2->cd(2);
-		double* x = fMeasuredADC;
-		double* dx = &fMeasuredADCError[0];
-		double* y = &fListOfEnergies[0];
+		Double_t* x = fMeasuredADC;
+		Double_t* dx = &fMeasuredADCError[0];
+		Double_t* y = &fListOfEnergies[0];
 		TGraphErrors* grE = new TGraphErrors(nFound, x, y, dx, 0);
 		grE->Draw("AP");
-		TF1* myFit1 = new TF1("myFit1", "pol1", 0, 6200);
-		myFit1->SetParameters(0, 5);
-		grE->Fit("myFit1", "R");
+		//TF1* myFit1 = new TF1("myFit1", "pol1", 0, 6200);
+		//myFit1->SetParameters(0, 5);
+		//grE->Fit("myFit1", "R");
+		//cout << "Chi2/NDF: " << (myFit1->GetChisquare())/(myFit1->GetNDF()) << endl;
 		//TF1* myFit2 = new TF1("myFit2", "pol2", 0, 6200);
 		//myFit2->SetParameters(0, 5);
 		//grE->Fit("myFit2", "R");
-		//TF1* myFit3 = new TF1("myFit3", "pol3", 0, 6200);
-		//myFit3->SetParameters(0, 5);
-		//grE->Fit("myFit3", "R");
+		//cout << "Chi2/NDF: " << (myFit2->GetChisquare())/(myFit2->GetNDF()) << endl;
+		TF1* myFit3 = new TF1("myFit3", "pol1", 0, 6200);
+		myFit3->SetParameters(0, 5);
+		grE->Fit("myFit3", "R");
+		cout << "Chi2/NDF: " << (myFit3->GetChisquare()) / (myFit3->GetNDF())
+				<< endl;
 		can2->SaveAs("fits.pdf");
-		return myFit1;	//change depending on the degree of the polynomial fit
+		return myFit3;	//change depending on the degree of the polynomial fit
+	}
+
+	TH1D* energyCalibratedSpectrum(TF1* fun, TH1D* adcHisto) {
+		Int_t nbins = adcHisto->GetXaxis()->GetNbins();
+		Double_t adcMax = adcHisto->GetXaxis()->GetXmax();
+		Double_t adcMin = adcHisto->GetXaxis()->GetXmin();
+
+		Double_t eMin = fun->Eval(adcMin);
+		Double_t eMax = fun->Eval(adcMax);
+
+		TString name = Form("Energy_%s", adcHisto->GetName());
+		TString title = Form("Energy_%s", adcHisto->GetTitle());
+
+		TH1D* eSpectrum = new TH1D(name, title, nbins, eMin, eMax);
+
+		for (int i = 0; i < nbins; i++) {
+			Double_t adc = adcHisto->GetBinCenter(i);
+			Double_t e = fun->Eval(adc);
+			Double_t counts = adcHisto->GetBinContent(i);
+			eSpectrum->Fill(e, counts);
+			eSpectrum->Sumw2(0);
+		}
+
+		return eSpectrum;
 	}
 };
 
@@ -230,13 +298,19 @@ int main() {
 	HistogramAndADCPeaks hOut;
 
 	TCanvas* can = new TCanvas("can", "ADC vs Counts", 2100, 900); //creating a canvas for ADC plot
+	can->Divide(2, 1);
 	TH1D* adcHisto = hOut.ConvertMaestroToHistogram(
-			"/Users/chrisw94/Desktop/SubtractedBackgroundFromSources.Txt",
+			"/Users/chrisw94/Desktop/20170728_BackgroundSubtractedSources.Txt",
 			"ADC");
 	can->cd(1);
 	adcHisto->Draw();
-	hOut.CalibrationFunction(); //making the calibration function, where p0 is the intercept
+	TF1* fun = (TF1*) hOut.CalibrationFunction(
+			"/Users/chrisw94/Desktop/20170728_BackgroundSubtractedSources.Txt",
+			"Calibration"); //making the calibration function, where p0 is the intercept
 	//p1 is the slope of the line
+	can->cd(2);
+	TH1D* eHisto = hOut.energyCalibratedSpectrum(fun, adcHisto);
+	eHisto->Draw();
 	can->SaveAs("plot.pdf");
 
 	return 0;
